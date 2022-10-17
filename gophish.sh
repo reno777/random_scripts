@@ -15,7 +15,7 @@ while true; do
         case $yn in
                 [Yy]* ) break;;
                 [Nn]* ) echo -e "${RED}Please do so before continuing.${NC}";;
-                * ) echo -e "${RED}Please dp so before continuing.${NC}";;
+                * ) echo -e "${RED}Please do so before continuing.${NC}";;
         esac
 done
 certbot certonly --standalone --expand -d $DOMAIN -d www.$DOMAIN -d mail.$DOMAIN -d login.microsoftonline.$DOMAIN -n --register-unsafely-without-email --agree-tos
