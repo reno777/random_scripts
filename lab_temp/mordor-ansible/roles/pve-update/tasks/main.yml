@@ -1,0 +1,47 @@
+---
+# roles/pve-update/tasks/main.yml
+# Updates all packages on a Proxmox node and optionally reboots if a new
+# kernel was installed. Runs sequentially (serial: 1 in the playbook) so
+# each node rejoins the cluster before the next one is touched.
+
+- name: Update apt cache
+  apt:
+    update_cache: yes
+    cache_valid_time: 0   # always refresh — don't trust cached state
+
+- name: Ensure vim is installed
+  apt:
+    name: vim
+    state: present
+
+- name: Upgrade all packages (dist-upgrade)
+  apt:
+    upgrade: dist
+    autoremove: yes
+    autoclean: yes
+  register: apt_upgrade_result
+
+- name: Check if reboot is required
+  stat:
+    path: /var/run/reboot-required
+  register: reboot_required
+
+- name: Show upgrade summary
+  debug:
+    msg: >
+      {{ inventory_hostname }} — packages changed:
+      {{ apt_upgrade_result.stdout_lines | select('match', '^[0-9]+ upgraded') | list }}
+      Reboot required: {{ reboot_required.stat.exists }}
+
+- name: Reboot if kernel was updated
+  reboot:
+    msg: "Ansible initiated reboot after kernel update"
+    reboot_timeout: 300
+    post_reboot_delay: 30
+  when: reboot_required.stat.exists
+
+- name: Verify node is back and Proxmox service is running after reboot
+  service:
+    name: pve-cluster
+    state: started
+  when: reboot_required.stat.exists

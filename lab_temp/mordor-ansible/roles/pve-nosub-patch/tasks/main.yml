@@ -1,0 +1,30 @@
+---
+# roles/pve-nosub-patch/tasks/main.yml
+# Deploys the no-subscription popup patch and a dpkg post-invoke hook
+# so the patch survives future apt upgrades automatically.
+
+- name: Deploy patch script to node
+  copy:
+    src: pve-nosub-patch.sh
+    dest: /usr/local/bin/pve-nosub-patch.sh
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Deploy dpkg post-invoke hook (re-applies patch after upgrades)
+  copy:
+    content: |
+      DPkg::Post-Invoke { "if [ -x /usr/local/bin/pve-nosub-patch.sh ]; then /usr/local/bin/pve-nosub-patch.sh; fi"; };
+    dest: /etc/apt/apt.conf.d/99pve-nosub-patch
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Run patch now
+  command: /usr/local/bin/pve-nosub-patch.sh
+  register: patch_result
+  changed_when: "'Patch applied' in patch_result.stdout"
+
+- name: Show patch result
+  debug:
+    msg: "{{ inventory_hostname }}: {{ patch_result.stdout }}"
