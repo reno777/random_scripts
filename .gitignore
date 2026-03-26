@@ -1,3 +1,29 @@
 *.swp
 .DS_Store
 .env
+.env.*
+
+# Certificates and private keys
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.cer
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Output files from scripts
+note_file.txt
+matches.txt
+*_users.txt
+*_passwords.txt
+
+# ZeroSSL output
+private_key_*.pem
+certificate_*.crt
+ca_bundle_*.crt

@@ -11,6 +11,7 @@ import time
 import sys
 import argparse
 import os
+from dotenv import load_dotenv
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from threading import Thread
 from urllib.parse import urlparse
@@ -23,7 +24,8 @@ from cryptography.hazmat.backends import default_backend
 import ipaddress
 
 # Configuration
-ZEROSSL_API_KEY = "REDACTED"  # Replace with your actual API key
+load_dotenv()
+ZEROSSL_API_KEY = os.environ.get("ZEROSSL_API_KEY", "")
 CERTIFICATE_VALIDITY_DAYS = 90
 
 # ZeroSSL API endpoints
