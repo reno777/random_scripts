@@ -78,13 +78,23 @@ DEPENDENCIES
 """
 
 import argparse
+import glob as _glob
 import ipaddress
+import os
 import re
 import sqlite3
 import sys
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
+
+# readline is available on macOS/Linux; silently unavailable on Windows.
+# Used only for tab-completion in the scope file prompt.
+try:
+    import readline as _readline
+    _READLINE = True
+except ImportError:
+    _READLINE = False
 
 try:
     import openpyxl
@@ -290,26 +300,69 @@ def parse_scope_file(scope_path: Path) -> int:
     return total
 
 
+def _path_completer(text, state):
+    """
+    Readline completer that expands filesystem paths.
+    Appends '/' to directories so the user can keep tabbing into subdirectories.
+    """
+    expanded = os.path.expanduser(text)
+    matches  = _glob.glob(expanded + "*")
+    matches  = [m + "/" if os.path.isdir(m) else m for m in sorted(matches)]
+    try:
+        return matches[state]
+    except IndexError:
+        return None
+
+
+def _input_with_path_completion(prompt: str) -> str:
+    """
+    Drop-in replacement for input() that enables filesystem tab-completion.
+    Restores the previous readline state afterwards so other prompts are
+    unaffected.  Falls back to plain input() when readline is unavailable.
+    """
+    if not _READLINE:
+        return input(prompt)
+
+    # Save existing readline state
+    old_completer = _readline.get_completer()
+    old_delims    = _readline.get_completer_delims()
+
+    try:
+        _readline.set_completer(_path_completer)
+        # Don't split on path characters — we want the whole path as one token
+        _readline.set_completer_delims(" \t\n")
+        # macOS ships libedit masquerading as readline; its bind syntax differs
+        if "libedit" in getattr(_readline, "__doc__", ""):
+            _readline.parse_and_bind("bind ^I rl_complete")
+        else:
+            _readline.parse_and_bind("tab: complete")
+        return input(prompt)
+    finally:
+        # Always restore previous state even if input() raises (e.g. Ctrl-C)
+        _readline.set_completer(old_completer)
+        _readline.set_completer_delims(old_delims)
+
+
 def prompt_scope_file() -> int | None:
     """
-    Interactively ask the user for a scope file path.
+    Interactively ask the user for a scope file path, with tab-completion.
 
     Returns the parsed target count, or None if the user skips.
-    The prompt retries if the given path does not exist.
+    Retries if the given path does not exist.
     """
     print(f"\n{'=' * 64}")
     print("  Scope file (used for accurate 'IPs Targeted' count).")
     print("  The file should list targets in nmap -iL format")
     print("  (IPs, CIDRs, dash ranges, or hostnames — one or more per line).")
+    print("  Tab-completion is available for the file path.")
     print("  Press Enter to skip (will fall back to nmap runstats).\n")
 
     while True:
-        raw = input("  Path to scope file: ").strip()
+        raw = _input_with_path_completion("  Path to scope file: ").strip()
         if not raw:
             print("  Skipping scope file — IPs Targeted will use nmap runstats.\n")
             return None
 
-        # Expand ~ and resolve the path
         scope_path = Path(raw).expanduser().resolve()
         if not scope_path.exists():
             print(f"  File not found: {scope_path}  (try again or press Enter to skip)\n")
@@ -358,9 +411,21 @@ def parse_nmap_xml(xml_path: Path) -> list[dict]:
     """
     Parse a single nmap XML file and return a list of port-level records.
 
-    One record is produced per open/open|filtered port per host. If a host
-    is up but has no qualifying ports, a single placeholder record is still
-    created so the host appears in the report (state: "up (no open ports)").
+    One record is produced per open/open|filtered port per host.
+
+    Placeholder records (state: "up (no open ports)") are only created when a
+    host is *confirmed reachable* with no open ports:
+      • Without -Pn: nmap ping-confirmed the host is up, so the placeholder
+        is always valid.
+      • With -Pn: nmap assumes every target is up without probing, so a
+        placeholder is only created if the host returned at least one 'closed'
+        port (TCP RST proves the host exists). All-filtered hosts under -Pn
+        are omitted entirely — we cannot distinguish "up but fully firewalled"
+        from "host doesn't exist".
+
+    A separate cleanup pass (remove_orphan_placeholders) removes any placeholder
+    that survives for an IP that also has real port records, which can happen
+    when multiple scan files are merged.
     """
     records: list[dict] = []
     try:
@@ -371,6 +436,9 @@ def parse_nmap_xml(xml_path: Path) -> list[dict]:
 
     # Store the original scan arguments for provenance (available in nmap XML)
     scan_args = root.get("args", "")
+
+    # Detect -Pn so we can apply stricter placeholder rules (see docstring)
+    pn_used = bool(re.search(r"(?<!\w)-Pn(?!\w)", scan_args))
 
     for host in root.findall("host"):
         # Skip hosts that did not respond
@@ -407,14 +475,22 @@ def parse_nmap_xml(xml_path: Path) -> list[dict]:
 
         ports_el = host.find("ports")
         if ports_el is None:
-            # Host is up but nmap returned no ports element at all
-            records.append(_base_record(ip, hostname, mac, os_name, scan_args))
+            # Host is up but nmap returned no ports element — only keep this
+            # row if we can confirm the host is real (not just -Pn assumed up)
+            if not pn_used:
+                records.append(_base_record(ip, hostname, mac, os_name, scan_args))
             continue
 
-        open_found = False
+        open_found   = False
+        closed_found = False  # TCP RST received — host confirmed real even with -Pn
+
         for port in ports_el.findall("port"):
             state_el = port.find("state")
             state = state_el.get("state", "") if state_el is not None else ""
+
+            if state == "closed":
+                closed_found = True
+                continue  # closed ports are not included in the report rows
 
             # Only include ports that are open or ambiguous (open|filtered)
             if state not in ("open", "open|filtered"):
@@ -452,8 +528,12 @@ def parse_nmap_xml(xml_path: Path) -> list[dict]:
             records.append(rec)
 
         if not open_found:
-            # Host responded to the scan but all ports were closed/filtered
-            records.append(_base_record(ip, hostname, mac, os_name, scan_args))
+            # Only emit a placeholder when the host is confirmed reachable:
+            #   - Without -Pn: host answered the discovery ping → confirmed up
+            #   - With -Pn:    only confirmed if a closed port (TCP RST) was seen;
+            #                  all-filtered means we cannot verify the host exists
+            if not pn_used or closed_found:
+                records.append(_base_record(ip, hostname, mac, os_name, scan_args))
 
     return records
 
@@ -571,6 +651,24 @@ def deduplicate(records: list[dict]) -> list[dict]:
     return list(best.values())
 
 
+def remove_orphan_placeholders(records: list[dict]) -> list[dict]:
+    """
+    Remove placeholder rows (port == "") for any IP that also has real port
+    records in the same list.
+
+    This can happen when multiple scan files are merged for the same location:
+    one file may have produced a placeholder for a host while another found
+    open ports on that same host. After deduplication the placeholder key
+    (ip, "", "") is distinct from any real port key, so it survives. This
+    function removes those orphaned placeholders as a final cleanup step.
+    """
+    ips_with_real_ports = {r["ip"] for r in records if r["port"] != ""}
+    return [
+        r for r in records
+        if not (r["port"] == "" and r["ip"] in ips_with_real_ports)
+    ]
+
+
 def ip_sort_key(rec: dict) -> tuple:
     """
     Sort key that orders records numerically by IP octets then by port number.
@@ -597,38 +695,32 @@ def extract_scan_stats(xml_path: Path) -> dict:
     """
     Extract scan-level statistics from a single nmap XML file.
 
-    Returns a dict with the following keys (all IP-based values are sets so
-    they deduplicate correctly when multiple scan files are merged):
+    Every countable value is stored as a set of (ip, port_id, protocol) tuples
+    so that merge_stats can union them and avoid double-counting ports that
+    appear in more than one scan file for the same location.
 
-      hosts_total           — total IPs nmap attempted (from <runstats>)
-      hosts_up_ips          — set of IPs nmap marked as 'up'
+      hosts_total           — int: total IPs nmap attempted (from <runstats>)
+      hosts_up_ips          — set of IP strings nmap marked as 'up'
       hosts_responsive_ips  — set of IPs with ≥1 open or closed port
-                              (reliable 'reachable' indicator even with -Pn,
-                               because a TCP RST/SYN-ACK proves the host exists;
-                               all-filtered means we simply don't know)
+                              (reliable reachability indicator even with -Pn;
+                               a TCP RST/SYN-ACK proves the host exists)
       hosts_with_open_ports — set of IPs with ≥1 open port
-      ports_open            — count of ports in state 'open'
-      ports_open_filtered   — count of ports in state 'open|filtered'
-      ports_filtered        — count of ports in state 'filtered'
-      ports_closed          — count of ports in state 'closed'
-      tcp_open              — open ports on TCP
-      udp_open              — open ports on UDP
-      unique_services       — set of service names identified (from -sV)
-      pn_used               — True if -Pn was present in the scan arguments
-                              (when True, hosts_up_ips == all targets, making
-                               it an unreliable 'reachable' metric)
+      ports_open            — set of (ip, port_id, protocol) for open ports
+      ports_open_filtered   — set of (ip, port_id, protocol) for open|filtered
+      ports_filtered        — set of (ip, port_id, protocol) for filtered
+      ports_closed          — set of (ip, port_id, protocol) for closed
+      unique_services       — set of service name strings (from -sV)
+      pn_used               — bool: True if -Pn was in the scan arguments
     """
     stats = {
         "hosts_total":           0,
         "hosts_up_ips":          set(),
         "hosts_responsive_ips":  set(),
         "hosts_with_open_ports": set(),
-        "ports_open":            0,
-        "ports_open_filtered":   0,
-        "ports_filtered":        0,
-        "ports_closed":          0,
-        "tcp_open":              0,
-        "udp_open":              0,
+        "ports_open":            set(),
+        "ports_open_filtered":   set(),
+        "ports_filtered":        set(),
+        "ports_closed":          set(),
         "unique_services":       set(),
         "pn_used":               False,
     }
@@ -639,21 +731,21 @@ def extract_scan_stats(xml_path: Path) -> dict:
         return stats
 
     # Detect -Pn in the scan arguments stored in the XML root element.
-    # When -Pn is active nmap skips host discovery and marks all targets as
-    # 'up', so the hosts_up count from runstats equals hosts_total — useless
-    # as a reachability metric.
+    # With -Pn, nmap skips host discovery and marks every target as 'up',
+    # making hosts_up_ips equal to the full scope — not a useful reachability
+    # metric. hosts_responsive_ips is the reliable alternative in that case.
     scan_args = root.get("args", "")
     if re.search(r"(?<!\w)-Pn(?!\w)", scan_args):
         stats["pn_used"] = True
 
-    # Pull the total-hosts count from <runstats>; used for scope fallback only.
+    # Pull the total-hosts count from <runstats>; used only as a fallback
+    # for "IPs Targeted" when no scope file is provided.
     runstats = root.find("runstats")
     if runstats is not None:
         hosts_el = runstats.find("hosts")
         if hosts_el is not None:
             stats["hosts_total"] = int(hosts_el.get("total", 0))
 
-    # Walk every host nmap recorded as 'up' and tally port states and services.
     for host in root.findall("host"):
         status_el = host.find("status")
         if status_el is None or status_el.get("state") != "up":
@@ -676,15 +768,12 @@ def extract_scan_stats(xml_path: Path) -> dict:
             state_el = port.find("state")
             state    = state_el.get("state", "") if state_el is not None else ""
             protocol = port.get("protocol", "")
+            port_id  = port.get("portid", "")
+            key      = (ip, port_id, protocol)  # unique identity for this port instance
 
             if state == "open":
-                stats["ports_open"] += 1
-                if protocol == "tcp":
-                    stats["tcp_open"] += 1
-                elif protocol == "udp":
-                    stats["udp_open"] += 1
+                stats["ports_open"].add(key)
                 if ip:
-                    # open counts as both responsive and having an open port
                     stats["hosts_responsive_ips"].add(ip)
                     stats["hosts_with_open_ports"].add(ip)
                 svc = port.find("service")
@@ -694,18 +783,17 @@ def extract_scan_stats(xml_path: Path) -> dict:
                         stats["unique_services"].add(name)
 
             elif state == "open|filtered":
-                stats["ports_open_filtered"] += 1
+                stats["ports_open_filtered"].add(key)
                 if ip:
                     stats["hosts_with_open_ports"].add(ip)
 
             elif state == "filtered":
-                stats["ports_filtered"] += 1
+                stats["ports_filtered"].add(key)
 
             elif state == "closed":
-                stats["ports_closed"] += 1
+                stats["ports_closed"].add(key)
                 if ip:
-                    # A closed port (TCP RST received) proves the host exists,
-                    # so count it as responsive even though no port is open.
+                    # A closed port (TCP RST received) confirms the host is up.
                     stats["hosts_responsive_ips"].add(ip)
 
     return stats
@@ -715,38 +803,35 @@ def merge_stats(stats_list: list[dict]) -> dict:
     """
     Combine statistics from multiple nmap scan files for the same location.
 
-    IP-based fields use set unions so the same host is never counted twice
-    across multiple scan files. Numeric port counts are summed (ports are
-    per-scan observations, not per-host unique values).
+    Every field is a set, so union operations naturally deduplicate. A port
+    that appears in three different scan files for the same location is counted
+    exactly once in the merged result.
     """
     merged = {
         "hosts_total":           0,
         "hosts_up_ips":          set(),
         "hosts_responsive_ips":  set(),
         "hosts_with_open_ports": set(),
-        "ports_open":            0,
-        "ports_open_filtered":   0,
-        "ports_filtered":        0,
-        "ports_closed":          0,
-        "tcp_open":              0,
-        "udp_open":              0,
+        "ports_open":            set(),
+        "ports_open_filtered":   set(),
+        "ports_filtered":        set(),
+        "ports_closed":          set(),
         "unique_services":       set(),
         "pn_used":               False,
     }
     for s in stats_list:
-        merged["hosts_total"]           += s["hosts_total"]
-        merged["ports_open"]            += s["ports_open"]
-        merged["ports_open_filtered"]   += s["ports_open_filtered"]
-        merged["ports_filtered"]        += s["ports_filtered"]
-        merged["ports_closed"]          += s["ports_closed"]
-        merged["tcp_open"]              += s["tcp_open"]
-        merged["udp_open"]              += s["udp_open"]
-        # Set unions — deduplicates IPs and service names across files
+        # hosts_total is still summed (integer from runstats); the scope file
+        # replaces this value in the sheet when one is provided.
+        merged["hosts_total"] += s["hosts_total"]
+        # All other fields are sets — union to deduplicate across files
         merged["hosts_up_ips"].update(s["hosts_up_ips"])
         merged["hosts_responsive_ips"].update(s["hosts_responsive_ips"])
         merged["hosts_with_open_ports"].update(s["hosts_with_open_ports"])
+        merged["ports_open"].update(s["ports_open"])
+        merged["ports_open_filtered"].update(s["ports_open_filtered"])
+        merged["ports_filtered"].update(s["ports_filtered"])
+        merged["ports_closed"].update(s["ports_closed"])
         merged["unique_services"].update(s["unique_services"])
-        # Flag the location if any of its scan files used -Pn
         merged["pn_used"] = merged["pn_used"] or s["pn_used"]
     return merged
 
@@ -879,19 +964,20 @@ def prompt_mapping(files: list[Path], label: str) -> dict[str, list[Path]]:
 # whether -Pn was used. This is the most reliable reachability metric available
 # from nmap data; "Hosts Up (nmap)" is shown alongside it for reference.
 _STAT_ROWS_BASE = [
-    ("Hosts Up (nmap)",                  lambda s: len(s["hosts_up_ips"])),
-    ("Hosts w/ Definitive Response",     lambda s: len(s["hosts_responsive_ips"])),
-    ("Hosts w/ Open Ports",              lambda s: len(s["hosts_with_open_ports"])),
-    ("Hosts w/ No Open Ports",           lambda s: max(0, len(s["hosts_responsive_ips"]) - len(s["hosts_with_open_ports"]))),
-    ("",                                 lambda s: ""),   # blank separator row
-    ("Total Open Ports",                 lambda s: s["ports_open"]),
-    ("  ↳ TCP Open",                     lambda s: s["tcp_open"]),
-    ("  ↳ UDP Open",                     lambda s: s["udp_open"]),
-    ("Total Open|Filtered Ports",        lambda s: s["ports_open_filtered"]),
-    ("Total Filtered Ports",             lambda s: s["ports_filtered"]),
-    ("Total Closed Ports",               lambda s: s["ports_closed"]),
-    ("",                                 lambda s: ""),   # blank separator row
-    ("Unique Services Identified",       lambda s: len(s["unique_services"])),
+    ("Hosts Up (nmap)",               lambda s: len(s["hosts_up_ips"])),
+    ("Hosts w/ Definitive Response",  lambda s: len(s["hosts_responsive_ips"])),
+    ("Hosts w/ Open Ports",           lambda s: len(s["hosts_with_open_ports"])),
+    ("Hosts w/ No Open Ports",        lambda s: max(0, len(s["hosts_responsive_ips"]) - len(s["hosts_with_open_ports"]))),
+    ("",                              lambda s: ""),   # blank separator row
+    # Port counts: len() of sets of (ip, port_id, protocol) tuples — unique across files
+    ("Total Open Ports",              lambda s: len(s["ports_open"])),
+    ("  ↳ TCP Open",                  lambda s: sum(1 for _, _, proto in s["ports_open"] if proto == "tcp")),
+    ("  ↳ UDP Open",                  lambda s: sum(1 for _, _, proto in s["ports_open"] if proto == "udp")),
+    ("Total Open|Filtered Ports",     lambda s: len(s["ports_open_filtered"])),
+    ("Total Filtered Ports",          lambda s: len(s["ports_filtered"])),
+    ("Total Closed Ports",            lambda s: len(s["ports_closed"])),
+    ("",                              lambda s: ""),   # blank separator row
+    ("Unique Services Identified",    lambda s: len(s["unique_services"])),
 ]
 
 # Fills used in the stats sheet header row and totals column
@@ -1188,6 +1274,9 @@ def main() -> None:
 
         # Merge duplicates that appear across multiple scan files for this location
         loc_recs = deduplicate(loc_recs)
+        # Remove placeholder rows for IPs that also have real port records —
+        # can occur when one file found open ports and another didn't
+        loc_recs = remove_orphan_placeholders(loc_recs)
         loc_recs.sort(key=ip_sort_key)
 
         # Join EyeWitness web title/status onto matching IP+port rows
